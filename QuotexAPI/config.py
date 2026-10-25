@@ -34,6 +34,9 @@ class QuotexConfig(BaseSettings):
     cf_clearance: Optional[str] = Field(None, validation_alias="QUOTEX_CF_CLEARANCE")
     user_agent: Optional[str] = Field(None, validation_alias="QUOTEX_USER_AGENT")
 
+    # Transport: "auto" (curl WebSocket, then real Chrome), "curl" or "browser"
+    transport: str = Field(default="auto", validation_alias="QUOTEX_TRANSPORT")
+
     # Connection Settings
     reconnect_enabled: bool = Field(
         default=True, validation_alias="QUOTEX_RECONNECT_ENABLED"

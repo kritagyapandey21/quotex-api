@@ -9,6 +9,7 @@ from uuid import uuid4
 from ..config import QuotexConfig
 from ..enums import ConnectionState
 from ..exceptions import ConnectionError, ReconnectError, WebSocketError
+from ..utils.browser_websocket import BrowserWebSocketTransport
 from ..utils.curl_websocket import CurlWebSocketTransport
 from .base import BaseService
 
@@ -24,7 +25,8 @@ class ConnectionService(BaseService):
             config: Configuration instance.
         """
         super().__init__(config)
-        self._ws: Optional[CurlWebSocketTransport] = None
+        self._ws = None  # CurlWebSocketTransport or BrowserWebSocketTransport
+        self._last_events: Dict[str, Any] = {}  # latest payload per event (server pushes data)
         self._state = ConnectionState.DISCONNECTED
         self._reconnect_attempts = 0
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -97,29 +99,33 @@ class ConnectionService(BaseService):
             if self.config.cf_clearance:
                 headers["Cookie"] = f"cf_clearance={self.config.cf_clearance}"
 
-            # Create curl WebSocket transport
-            self._ws = CurlWebSocketTransport(self.config.ws_url, headers)
-            
-            # Set up message callback - schedule coroutine in main loop
-            def on_message(msg):
-                if self._loop and self._loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        self._handle_message(msg),
-                        self._loop
-                    )
-            
-            self._ws.set_on_message(on_message)
-            
-            # Connect (runs in thread)
+            # Pick the transport: curl (fast, but Cloudflare usually refuses it), real Chrome
+            # (works anywhere Chrome runs), or "auto" = curl first, then Chrome.
+            # Messages are read from the transport queue by _receive_messages (no callback,
+            # otherwise every message would be processed twice).
             loop = asyncio.get_event_loop()
-            connected = await loop.run_in_executor(None, self._ws.connect)
-            
+            mode = (self.config.transport or "auto").lower()
+            connected = False
+            if mode in ("auto", "curl"):
+                self._ws = CurlWebSocketTransport(
+                    self.config.ws_url, headers, allow_polling=(mode == "curl")
+                )
+                connected = await loop.run_in_executor(None, self._ws.connect)
+                if connected:
+                    self.logger.info("WebSocket connection established via curl")
+            if not connected and mode in ("auto", "browser"):
+                self.logger.info("Using real Chrome for the WebSocket (needed past Cloudflare)")
+                self._ws = BrowserWebSocketTransport(self.config.ws_url, headers)
+                connected = await loop.run_in_executor(None, self._ws.connect)
+                if connected:
+                    self.logger.info("WebSocket connection established via browser")
+
             if not connected:
-                raise ConnectionError("Failed to establish curl WebSocket connection")
+                self._ws = None
+                raise ConnectionError(f"Failed to establish WebSocket connection (transport={mode})")
 
             self._state = ConnectionState.CONNECTED
             self._reconnect_attempts = 0
-            self.logger.info("WebSocket connection established via curl")
 
             # Start receiving messages
             self._receive_task = asyncio.create_task(self._receive_messages())
@@ -283,10 +289,8 @@ class ConnectionService(BaseService):
 
         try:
             loop = asyncio.get_event_loop()
-            print(f"[DEBUG] About to send raw: {message[:100]}...")
             await loop.run_in_executor(None, self._ws.send, message)
-            print(f"[DEBUG] Raw send completed")
-            self.logger.info(f"Sent raw message: {message[:100]}...")
+            self.logger.debug("Sent raw message (%d chars)", len(message))
         except Exception as e:
             self.logger.error(f"Failed to send message: {str(e)}")
             raise WebSocketError(f"Failed to send message: {str(e)}") from e
@@ -322,10 +326,8 @@ class ConnectionService(BaseService):
             # Format in Socket.IO format: 42["event", data]
             socketio_msg = self._format_socketio_message(event, data)
             
-            print(f"[DEBUG] Sending Socket.IO event '{event}': {socketio_msg[:200]}...")
-            self.logger.info(f"Sending Socket.IO event '{event}': {socketio_msg[:200]}...")
+            self.logger.info(f"Sending Socket.IO event '{event}'")
             await self.send_raw(socketio_msg)
-            print(f"[DEBUG] Socket.IO event '{event}' sent successfully")
             self.logger.info(f"Socket.IO event '{event}' sent successfully")
             
             if expect_response:
@@ -406,6 +408,10 @@ class ConnectionService(BaseService):
             self.logger.error(f"Failed to send request: {e}")
             raise WebSocketError(f"Send failed: {str(e)}") from e
     
+    def last_event(self, event_name: str) -> Optional[Any]:
+        """Latest payload received for an event, or None (Quotex pushes balances etc. after login)."""
+        return self._last_events.get(event_name)
+
     def subscribe(self, event_type: str, handler: Callable) -> None:
         """
         Subscribe to WebSocket events.
@@ -451,12 +457,10 @@ class ConnectionService(BaseService):
                         # No message received, continue
                         continue
 
-                    print(f"[DEBUG] Received raw message: {message[:200]}...")
                     self.logger.debug(f"Received raw message: {message}")
                     
                     # Handle Socket.IO ping
                     if message == '2':
-                        print("[DEBUG] Received ping, sending pong")
                         self.logger.debug("Received Socket.IO ping, sending pong")
                         await self.send_raw('3')
                         continue
@@ -466,7 +470,6 @@ class ConnectionService(BaseService):
                     
                     if parsed:
                         event_name, event_data = parsed
-                        print(f"[DEBUG] Parsed event '{event_name}': {str(event_data)[:200]}...")
                         self.logger.debug(f"Parsed Socket.IO event '{event_name}': {event_data}")
                         
                         # Route the event
@@ -499,6 +502,8 @@ class ConnectionService(BaseService):
             event_name: Name of the event
             event_data: Event payload data
         """
+        self._last_events[event_name] = event_data
+
         # Check if there are handlers registered for this event
         if event_name in self._event_handlers:
             for handler in self._event_handlers[event_name]:

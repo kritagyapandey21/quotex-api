@@ -19,14 +19,21 @@ logger = get_logger(__name__)
 class CurlWebSocketTransport:
     """HTTP polling transport using curl_cffi (bypasses Cloudflare)."""
     
-    def __init__(self, url: str, headers: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        allow_polling: bool = True,
+    ):
         """
         Initialize HTTP polling transport.
-        
+
         Args:
             url: WebSocket URL (will be converted to HTTP polling)
             headers: Optional HTTP headers
+            allow_polling: Fall back to HTTP long-polling when the WebSocket upgrade is refused
         """
+        self.allow_polling = allow_polling
         self.url = url
         self.headers = headers or {}
         self.session = None
@@ -49,6 +56,9 @@ class CurlWebSocketTransport:
         """
         if self._connect_websocket():
             return True
+
+        if not self.allow_polling:
+            return False
 
         print("[HTTP POLLING] Connecting...")
 
@@ -302,7 +312,7 @@ class CurlWebSocketTransport:
                 **self.headers
             }
             
-            print(f"[HTTP POLLING] POST: {message[:150]}")
+            print(f"[HTTP POLLING] POST sent")
             response = self.session.post(url, headers=headers, data=message, timeout=10)
             
             print(f"[HTTP POLLING] Send response ({response.status_code}): {response.text[:200]}")

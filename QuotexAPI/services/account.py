@@ -52,39 +52,33 @@ class AccountService(BaseService):
         self.logger.info("Fetching account balances")
 
         try:
-            # Subscribe to balance response first
-            balance_future = asyncio.Future()
-            
-            def handle_balance(data):
-                if not balance_future.done():
-                    balance_future.set_result(data)
-            
-            # Quotex sends balance in response to s_balance/list request
-            # The response comes as: 451-[{"liveBalance":0,"demoBalance":10000,...}]
-            self._connection.subscribe("s_balance/list", handle_balance)
-            
-            # Request balance using Socket.IO format
-            # Format: 42["s_balance/list",{"_placeholder":true,"num":0}]
-            await self._connection.send_socketio_event(
-                event="s_balance/list",
-                data={"_placeholder": True, "num": 0},
-                expect_response=False
-            )
-            
-            try:
-                response = await asyncio.wait_for(balance_future, timeout=10.0)
-            except asyncio.TimeoutError:
-                self.logger.error("Balance request timeout")
-                # Use default values
-                response = {
-                    "demoBalance": 10000.0,
-                    "liveBalance": 0.0,
-                    "tournamentsBalances": {},
-                    "dayLimit": 0,
-                    "dayBalance": 0
-                }
-            finally:
-                self._connection.unsubscribe("s_balance/list", handle_balance)
+            # Quotex pushes the balance right after authorization (event "s_balance/list",
+            # payload {"liveBalance":..,"demoBalance":..}), so use the latest pushed value.
+            response = self._connection.last_event("s_balance/list")
+
+            if not isinstance(response, dict):
+                # Not received yet: ask for it and wait
+                balance_future = asyncio.Future()
+
+                def handle_balance(data):
+                    if not balance_future.done():
+                        balance_future.set_result(data)
+
+                self._connection.subscribe("s_balance/list", handle_balance)
+                try:
+                    await self._connection.send_socketio_event(
+                        event="s_balance/list",
+                        data={"_placeholder": True, "num": 0},
+                        expect_response=False
+                    )
+                    response = await asyncio.wait_for(balance_future, timeout=10.0)
+                except asyncio.TimeoutError:
+                    raise QuotexAPIError("Timed out waiting for the balance from Quotex")
+                finally:
+                    self._connection.unsubscribe("s_balance/list", handle_balance)
+
+            if not isinstance(response, dict):
+                raise QuotexAPIError(f"Unexpected balance payload: {response!r}")
             
             # Parse Quotex balance format
             # Response: {"liveBalance":0,"demoBalance":10000,"tournamentsBalances":{},"dayLimit":0,"dayBalance":0}

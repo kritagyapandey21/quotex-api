@@ -17,15 +17,14 @@ PKGS="python3 python3-venv xvfb unzip curl ca-certificates libnss3 libgbm1 libas
 libatk-bridge2.0-0 libgtk-3-0 libxss1 libxkbcommon0 fonts-liberation"
 MISSING=""
 for p in $PKGS; do
-    # libasound2 is "libasound2t64" on newer Ubuntu; accept either
-    if ! dpkg -s "$p" >/dev/null 2>&1 && ! dpkg -s "${p}t64" >/dev/null 2>&1; then
+    if ! dpkg -s "$p" >/dev/null 2>&1; then
         MISSING="$MISSING $p"
     fi
 done
 if [ -n "$MISSING" ]; then
     echo "Installing missing packages:$MISSING"
-    sudo apt-get update
-    sudo apt-get install -y --no-install-recommends $MISSING
+    $SUDO apt-get update
+    $SUDO apt-get install -y --no-install-recommends $MISSING
 else
     echo "All OS packages already present."
 fi

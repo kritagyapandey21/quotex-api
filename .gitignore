@@ -211,3 +211,4 @@ vps/browser/
 instruments_raw.json
 capture.json
 capture_history.json
+candles.db*

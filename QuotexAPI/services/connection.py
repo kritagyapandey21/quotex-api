@@ -84,12 +84,19 @@ class ConnectionService(BaseService):
             # Headers for curl transport (bypasses Cloudflare bot protection)
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 OPR/126.0.0.0",
-                "Origin": "https://qxbroker.com",
+                "Origin": "https://quotex.com",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
                 "Accept-Language": "en-US,en;q=0.9",
             }
             
+            # Reuse the browser's Cloudflare clearance so the WebSocket upgrade is accepted.
+            # cf_clearance is bound to the User-Agent that obtained it.
+            if self.config.user_agent:
+                headers["User-Agent"] = self.config.user_agent
+            if self.config.cf_clearance:
+                headers["Cookie"] = f"cf_clearance={self.config.cf_clearance}"
+
             # Create curl WebSocket transport
             self._ws = CurlWebSocketTransport(self.config.ws_url, headers)
             

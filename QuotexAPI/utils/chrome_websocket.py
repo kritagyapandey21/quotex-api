@@ -67,7 +67,7 @@ class ChromeWebSocketTransport:
             
             # Navigate to Quotex to establish session
             print("[CHROME] Loading Quotex...")
-            self.driver.get("https://qxbroker.com")
+            self.driver.get("https://quotex.com")
             
             # Wait a bit for page to load
             time.sleep(2)

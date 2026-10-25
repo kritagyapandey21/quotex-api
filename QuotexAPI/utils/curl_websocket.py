@@ -10,6 +10,7 @@ import re
 import json as json_module
 from typing import Optional, Dict, Callable
 from curl_cffi import requests
+from curl_cffi.const import CurlWsFlag
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,6 +35,7 @@ class CurlWebSocketTransport:
         self.message_queue = queue.Queue()
         self.running = False
         self.poller_thread: Optional[threading.Thread] = None
+        self._ws_conn = None
         self._on_message: Optional[Callable] = None
         self._on_error: Optional[Callable] = None
         self._on_close: Optional[Callable] = None
@@ -45,8 +47,11 @@ class CurlWebSocketTransport:
         Returns:
             True if connection successful, False otherwise
         """
+        if self._connect_websocket():
+            return True
+
         print("[HTTP POLLING] Connecting...")
-        
+
         # Retry logic to deal with Cloudflare's intermittent blocking
         max_retries = 3
         retry_delay = 2
@@ -66,7 +71,7 @@ class CurlWebSocketTransport:
                 self.session = requests.Session(impersonate="chrome110")
                 
                 headers = {
-                    'Origin': 'https://qxbroker.com',
+                    'Origin': 'https://quotex.com',
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': '*/*',
                     'Accept-Language': 'en-US,en;q=0.9',
@@ -147,6 +152,51 @@ class CurlWebSocketTransport:
         logger.error("Failed to connect after all retries")
         return False
     
+    def _connect_websocket(self) -> bool:
+        """Try a native WebSocket upgrade (needs a valid Cloudflare clearance cookie)."""
+        try:
+            headers = {
+                'Origin': 'https://quotex.com',
+                'Accept-Language': 'en-US,en;q=0.9',
+                **self.headers,
+            }
+            self.session = requests.Session(impersonate="chrome124")
+            print(f"[WEBSOCKET] Connecting to {self.url}")
+            self._ws_conn = self.session.ws_connect(self.url, headers=headers, timeout=15)
+        except Exception as e:
+            print(f"[WEBSOCKET] Upgrade failed ({str(e)[:120]}), falling back to polling")
+            self._ws_conn = None
+            return False
+
+        self.running = True
+        self.sid = "websocket"
+        self.poller_thread = threading.Thread(
+            target=self._ws_read_loop, daemon=True, name="WSReader"
+        )
+        self.poller_thread.start()
+        logger.info("WebSocket connection established")
+        return True
+
+    def _ws_read_loop(self):
+        """Read frames from the native WebSocket in a background thread."""
+        while self.running and self._ws_conn is not None:
+            try:
+                data, _flags = self._ws_conn.recv()
+            except Exception as e:
+                if self.running:
+                    logger.error(f"WebSocket read error: {e}")
+                break
+            msg = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+            self.message_queue.put(msg)
+            if self._on_message:
+                try:
+                    self._on_message(msg)
+                except Exception as e:
+                    logger.error(f"Callback error: {e}")
+        self.running = False
+        if self._on_close:
+            self._on_close()
+
     def _parse_polling_payload(self, payload: str) -> list:
         """Parse Socket.IO polling payload format: <length>:<message>..."""
         messages = []
@@ -174,7 +224,7 @@ class CurlWebSocketTransport:
         print("[HTTP POLLING] Starting poller thread")
         
         headers = {
-            'Origin': 'https://qxbroker.com',
+            'Origin': 'https://quotex.com',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': '*/*',
             **self.headers
@@ -233,11 +283,19 @@ class CurlWebSocketTransport:
         if not self.session or not self.sid:
             print("[HTTP POLLING] ERROR: Not connected")
             return False
-        
+
+        if self._ws_conn is not None:
+            try:
+                self._ws_conn.send(message, CurlWsFlag.TEXT)
+                return True
+            except Exception as e:
+                logger.error(f"WebSocket send error: {e}")
+                return False
+
         try:
             url = f"{self.polling_url}&sid={self.sid}"
             headers = {
-                'Origin': 'https://qxbroker.com',
+                'Origin': 'https://quotex.com',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Content-Type': 'text/plain;charset=UTF-8',
                 'Accept': '*/*',
@@ -281,7 +339,13 @@ class CurlWebSocketTransport:
         """Close the connection."""
         self.running = False
         self.sid = None
-        logger.info("HTTP polling connection closed")
+        if self._ws_conn is not None:
+            try:
+                self._ws_conn.close()
+            except Exception:
+                pass
+            self._ws_conn = None
+        logger.info("Transport connection closed")
     
     def is_connected(self) -> bool:
         """Check if connection is active."""

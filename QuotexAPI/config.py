@@ -26,9 +26,13 @@ class QuotexConfig(BaseSettings):
         default="https://api.quotex.io", validation_alias="QUOTEX_API_URL"
     )
     ws_url: str = Field(
-        default="wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket",
+        default="wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket",
         validation_alias="QUOTEX_WS_URL"
     )
+
+    # Cloudflare clearance copied from a logged-in browser (optional)
+    cf_clearance: Optional[str] = Field(None, validation_alias="QUOTEX_CF_CLEARANCE")
+    user_agent: Optional[str] = Field(None, validation_alias="QUOTEX_USER_AGENT")
 
     # Connection Settings
     reconnect_enabled: bool = Field(

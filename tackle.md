@@ -15,8 +15,11 @@ Written after getting the library to log in and read live data from a VPS on 202
 | SSID login (demo account) | Working | `s_authorization` received, "Authenticated successfully" |
 | Read balances | Working | Demo $9,861.30 / Real $0.00 (matches the browser) |
 | Read the full instrument list with payouts | Working | 92 instruments, 29 open at payout >= 80% |
+| Live prices (ticks) per pair | Working | `quotes/stream` captured on the VPS (about 2 ticks/s per pair) |
+| Live payout per pair | Working | `depth/change` captured on the VPS (e.g. `["AUDCAD_otc", 91]`) |
+| Past candle history from Quotex | **Not working** | `history/load/line` returns empty, `history/load` never replies (16 variants tried) |
+| 1-minute candles built from live ticks | **Written, simulated, not yet run on Quotex** | `examples/collect_candles.py`; simulated feed passes all checks |
 | Place trades, track results | **Not tested** | Code exists, uses guessed message formats |
-| Candles / chart data | **Not tested** | |
 | Email + password login | **Not working / not tested** | Library only simulates it |
 | Unattended running (SSID refresh) | **Not built** | SSID expires after hours |
 
@@ -86,6 +89,31 @@ How we found the crashpad cause: `dmesg` ruled out an OOM kill, then running Chr
 4. **The SSID was printed in logs.** Debug `print`s and an INFO log line included the full login message, which contains the SSID. Removed the prints; the log now says only `Sending Socket.IO event 'authorization'`.
 5. **Pushed data was missed.** The server pushes balance/instruments right after login, before the library subscribed. Fix: the connection service now remembers the latest payload for every event (`last_event(name)`), and services read from that.
 
+### 2.9 Getting per-pair data (prices, payout, candles)
+Goal: for every pair with payout >= 80%, collect the data needed to place a 1-minute trade, including 1-minute candle data.
+
+1. **Capture (`examples/capture_pair.py`).** Logged in on demo, followed one pair (`AUDCAD_otc`, 91%) and sent several candidate requests. Quotex answered with 8 event types in 20 s (79 events):
+   - `quotes/stream` (51 events): live ticks, payload `[["AUDCAD_otc", 1792934007.654, 1.01653, 0]]` = symbol, unix timestamp (seconds, with ms), price, a trailing 0 of unknown meaning.
+   - `depth/change` (22 events): live payout, payload `[["AUDCAD_otc", 91]]`.
+   - `s_balance/list`, `settings/list`, `orders/opened/list`, `s_drawing/load`, `orders/closed/list` (pushed once after login).
+   - `history/load/line`: replied `{"index": ..., "data": []}`, empty.
+   - `history/load`: no reply.
+2. **What the closed-orders record teaches.** Fields: `id`, `openTime`, `closeTime`, `openTimestamp`, `closeTimestamp`, `asset`, `amount`, `command`, `openPrice`, `closePrice`, `profit`, `percentProfit`, `percentLoss`, `isDemo`, `currency`. A trade with `command: 1` that won while closing *below* its open price suggests `1` = put and `0` = call. This is inferred, not confirmed by a test trade.
+3. **History sweep (`examples/capture_history.py`).** Sent 16 variants (event `history/load/line` or `history/load`; time in seconds or milliseconds; offset 900 or 3600; with or without `period: 60`), matched replies by a unique `index`. Result: all 8 `history/load/line` variants returned `data: 0` items, all 8 `history/load` variants got no reply. The correct history request is still unknown. The reliable way to learn it is to copy the request the real website sends (browser DevTools > Network > WS > Messages while opening a chart); that was explained to the user but not done.
+4. **Workaround chosen by the user: build candles ourselves from live ticks.** `quotes/stream` gives every price tick, so a 1-minute open/high/low/close candle can be built per pair. History therefore only starts when collection starts (about 6 complete candles after 6-7 minutes).
+5. **Collector design (`examples/collect_candles.py`)**, with the user's rules:
+   - Follow every open pair (`instruments/follow`) so payout changes for all pairs are seen.
+   - Track only pairs whose payout is >= `--min` (default 80); ticks of other pairs are discarded.
+   - A tracked pair whose payout falls below the threshold has its stored candles **deleted immediately** (`--grace N` delays this by N seconds to avoid wiping on a 79/80 flap; default 0 = immediate, as requested).
+   - When its payout rises again, tracking restarts from empty.
+   - A tracked pair with no ticks for `--stale` seconds (default 300) is dropped too, because a gap makes candles misleading; it restarts on its next tick.
+   - **Sliding window:** only the newest `--window` candles per pair are kept (default 30, enough for RSI 14 / EMA 20 / Bollinger 20). Older rows are deleted on every new candle.
+   - Candles are cleared at startup (a restart leaves a data gap).
+   - Storage: SQLite (`candles.db`). Tables `pairs(symbol, name, type, payout, is_open, updated_at, raw)` and `candles(symbol, minute_ts, open, high, low, close, ticks)`. Only completed minutes are stored; the in-progress candle lives in memory. The first candle after start is usually partial.
+   - Watchdog: no ticks for 90 s means the connection is dead, so it exits with a message (there is no auto-reconnect yet).
+   - `--show` prints stored data (pairs >= min, candle counts, last candles) without any network access.
+6. **How it was tested without Quotex.** The storage and display part was run on a fake database. The collection logic was run through a simulated feed (fake client, 40 minutes of synthetic ticks, payout changes): with a window of 5, each qualifying pair held exactly the newest 5 candles; a 70% pair stored nothing; dropping a pair to 79% deleted its 5 candles instantly and ticks while below 80 were ignored; raising it to 82% restarted it from empty with no old data; a pair at 81% began tracking; all open pairs were followed. The real run on the VPS is still to be done, and the open question there is whether following about 30 pairs at once works (the status line reports how many pairs are tracked).
+
 ---
 
 ## 3. How it works now
@@ -128,6 +156,9 @@ Environment variable `QUOTEX_TRANSPORT`:
 | `vps/setup_ubuntu.sh` | isolated install (venv, private Chrome, only-missing apt packages) |
 | `vps/probe_browser.py` | standalone check: does a real Chrome on this machine pass Cloudflare and open the WebSocket |
 | `examples/list_pairs.py` | NEW. Lists all pairs with payout, filters by minimum payout |
+| `examples/capture_pair.py` | NEW. Logs in (demo), follows one pair, records every event Quotex sends (learned the price / payout formats) |
+| `examples/capture_history.py` | NEW. Sweeps 16 history-request variants to find one that returns candles (none did) |
+| `examples/collect_candles.py` | NEW. Builds 1-minute candles from live ticks for all pairs >= min payout, with sliding window and drop/restart rules; `--show` to read the data |
 | `.gitignore`, `.gitattributes` | ignore `vps/browser/`, `instruments_raw.json`; keep `.sh` files LF |
 
 Git history on `main` (user's repo): domain change + probe, setup fixes, browser transport, bridge ordering fix, list_pairs.
@@ -161,6 +192,22 @@ unset QUOTEX_SSID
 ```
 Each run takes about 10-20 s and uses roughly 500-900 MB while Chrome is open.
 
+### Collecting candles (10-minute test run)
+```bash
+cd ~/quotex-api
+git pull
+read -rs -p "SSID: " QUOTEX_SSID; export QUOTEX_SSID; echo
+systemd-run --scope -E QUOTEX_SSID -p MemoryMax=900M -p MemorySwapMax=0 -p CPUQuota=50% \
+  nice -n 10 xvfb-run -a .venv/bin/python examples/collect_candles.py --minutes 10
+unset QUOTEX_SSID
+.venv/bin/python examples/collect_candles.py --show --last 5      # read what was stored
+```
+Options: `--min 85` (payout threshold), `--window 60` (candles kept per pair), `--grace 30` (seconds below threshold before deleting), `--stale 300` (seconds without ticks before dropping a pair), `--minutes N` (stop after N minutes; 0 = run until stopped).
+Status line every 30 s: pairs tracked, candles stored, drops so far. Running it detached in the background (a named, limited `systemd-run` job, stoppable with one command) is planned but not set up yet.
+
+### Capture scripts (for investigating Quotex messages)
+`examples/capture_pair.py [PAIR]` and `examples/capture_history.py [PAIR]`, run the same way as above. Output goes to `capture.json` / `capture_history.json` (git-ignored).
+
 To undo everything: `rm -rf ~/quotex-api` (the only change outside it is the extra apt libraries).
 
 ### Getting the SSID
@@ -187,6 +234,10 @@ Instrument entry layout (confirmed against real data):
 e.g. `[36, "AUDCAD", "AUD/CAD", "currency", 5, 80, 60, 30, 3, 0, 67, 0, [[30,"put"],...], 1792972800, false, ...]`.
 The meaning of the numbers between the payout and the open flag, and whether the payout differs by expiry, is not yet identified.
 
+**Live price and payout stream (capture, pair `AUDCAD_otc`, 20 s):** 51 `quotes/stream` ticks and 22 `depth/change` payout updates for the one followed pair, e.g. `[["AUDCAD_otc", 1792934007.654, 1.01653, 0]]` and `[["AUDCAD_otc", 91]]`.
+
+**History requests:** 16 variants tried, none returned candle data (see section 2.9).
+
 ---
 
 ## 6. Security notes
@@ -205,10 +256,12 @@ The meaning of the numbers between the payout and the open flag, and whether the
 3. **`switch_account()` is wrong.** It sends a `switch_account` message that Quotex does not use; real switching probably means re-authorizing with a different `isDemo`.
 4. **Email + password login is a stub.** It sends a made-up `login` event. Real Quotex login is over HTTPS with its own protections and needs separate work.
 5. **SSID expiry.** There is no automatic refresh. A long-running process dies when the token expires. This is the biggest blocker for unattended use.
-6. **Candles / live prices** (`depth/follow`, etc.) not implemented or tested.
-7. **Payout per expiry** not identified.
-8. **No reconnect.** `_reconnect()` is a stub ("Reconnection would happen here"). If Chrome or the socket drops, the process must be restarted.
-9. **Each run starts Chrome** (about 12 s). A long-lived process would avoid that.
-10. **Cloudflare can change.** It may start blocking the VPS IP or the browser setup at any time. The probe script (`vps/probe_browser.py`) is the quick way to re-check.
-11. Documentation in the repo (`IMPLEMENTATION_STATUS.md`, `WEBSOCKET_*`, `SOCKETIO_*`) describes behavior from earlier attempts and overstates what works. Treat this file as the current truth.
-12. Old, unused files remain: `chrome_websocket.py` (half-finished earlier browser attempt), many root-level `test_*.py` experiment scripts.
+6. **Candle history from Quotex is unsolved.** The real history request is unknown (see 2.9). Candles are built from live ticks instead, so there is no history before collection starts. Library methods for prices/candles (`get_candles`, `subscribe_candles`) are still the old unverified code; the working path is in `examples/collect_candles.py`.
+7. **Collector not yet run against real Quotex.** Unknown: whether following about 30 pairs at once works, and how steady the tick stream is for all of them. No auto-reconnect; it exits after 90 s without ticks. It needs a fresh SSID each run (expires after hours) and runs in the foreground only.
+8. **Payout per expiry** not identified. Each instrument entry carries more numbers after the payout (for example `60, 30, 3, 0, 67`), and a list like `[[30,"put"],[60,"call"],...]`, whose meaning is unknown. The `depth/change` payout is a single number per pair; whether it applies to the 1-minute expiry is not confirmed.
+9. **Direction code** (`command` 0 = call, 1 = put) is inferred from one winning past order, not tested. The order-placement message (`orders/open`) format is unverified.
+10. **No reconnect.** `_reconnect()` is a stub ("Reconnection would happen here"). If Chrome or the socket drops, the process must be restarted.
+11. **Each run starts Chrome** (about 12 s). A long-lived process would avoid that.
+12. **Cloudflare can change.** It may start blocking the VPS IP or the browser setup at any time. The probe script (`vps/probe_browser.py`) is the quick way to re-check.
+13. Documentation in the repo (`IMPLEMENTATION_STATUS.md`, `WEBSOCKET_*`, `SOCKETIO_*`) describes behavior from earlier attempts and overstates what works. Treat this file as the current truth.
+14. Old, unused files remain: `chrome_websocket.py` (half-finished earlier browser attempt), many root-level `test_*.py` experiment scripts.

@@ -36,8 +36,13 @@ window.__qx = {q: [], ws: null, state: 'connecting', err: null, pending: null};
 const qx = window.__qx;
 const ws = new WebSocket(url);
 qx.ws = ws;
-ws.onopen = () => { qx.state = 'open'; };
-ws.onclose = (e) => { qx.state = 'closed'; qx.err = 'closed ' + e.code; };
+// Engine.IO v3 (EIO=3): the CLIENT must send a ping ("2") every pingInterval (25 s) or the
+// server drops the connection after ~30 s. Done in the page so it keeps going even if Python is busy.
+ws.onopen = () => {
+  qx.state = 'open';
+  qx.pinger = setInterval(() => { if (ws.readyState === 1) ws.send('2'); }, 20000);
+};
+ws.onclose = (e) => { qx.state = 'closed'; qx.err = 'closed ' + e.code; clearInterval(qx.pinger); };
 ws.onerror = () => { qx.err = 'websocket error'; };
 qx.chain = Promise.resolve();  // keeps frames in arrival order while blobs decode asynchronously
 ws.onmessage = (m) => {

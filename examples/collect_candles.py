@@ -213,6 +213,9 @@ async def collect(args) -> int:
             if args.minutes and time.time() - start >= args.minutes * 60:
                 print("Time limit reached.")
                 break
+            if not api.is_connected or not api.connection._ws or not api.connection._ws.is_connected():
+                print("WebSocket closed - exiting (restart to resume; candles are cleared on start).")
+                return 3
             if time.time() - stats["last_tick"] > STALL_SECONDS:
                 print(f"No ticks for {STALL_SECONDS}s - connection looks dead, exiting.")
                 return 3

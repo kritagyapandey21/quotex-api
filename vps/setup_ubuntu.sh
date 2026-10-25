@@ -49,7 +49,8 @@ for kind in ("chrome", "chromedriver"):
     with urllib.request.urlopen(url) as r:
         zipfile.ZipFile(io.BytesIO(r.read())).extractall(dest)
 EOF
-    chmod +x "$BROWSER_DIR/chrome-linux64/chrome" "$BROWSER_DIR/chromedriver-linux64/chromedriver"
+    # zip extraction drops the executable bit; Chrome also needs its helpers (crashpad handler etc.)
+    chmod -R u+x "$BROWSER_DIR"
 fi
 "$BROWSER_DIR/chrome-linux64/chrome" --version || echo "WARNING: chrome failed to start, a system library is probably missing"
 

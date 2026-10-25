@@ -18,7 +18,11 @@ Written after getting the library to log in and read live data from a VPS on 202
 | Live prices (ticks) per pair | Working | `quotes/stream` captured on the VPS (about 2 ticks/s per pair) |
 | Live payout per pair | Working | `depth/change` captured on the VPS (e.g. `["AUDCAD_otc", 91]`) |
 | Past candle history from Quotex | **Not working** | `history/load/line` returns empty, `history/load` never replies (16 variants tried) |
-| 1-minute candles built from live ticks | **Written, simulated, not yet run on Quotex** | `examples/collect_candles.py`; simulated feed passes all checks |
+| 1-minute candles built from live ticks | **Working** | 10-minute run on the VPS: 45 pairs, 450 candles (10 per pair), values sane (high >= low, each open follows the previous close) |
+| Collector running in the background on the VPS | **Running** (transient `systemd-run` job since 2026-10-25 20:03 IST) | healthy at first check: 404 MB RAM (cap 900 MB), 36 pairs tracked |
+| Read stored data instantly (CLI / JSON / SQLite) | Working | `collect_candles.py --show [--json]` |
+| Drop / restart when a payout crosses 80% | Simulated only | no pair crossed the line during the real runs |
+| Multi-hour stability, restart after crash / reboot | **Not yet verified** | persistent service file documented, not confirmed installed |
 | Place trades, track results | **Not tested** | Code exists, uses guessed message formats |
 | Email + password login | **Not working / not tested** | Library only simulates it |
 | Unattended running (SSID refresh) | **Not built** | SSID expires after hours |
@@ -114,6 +118,8 @@ Goal: for every pair with payout >= 80%, collect the data needed to place a 1-mi
    - `--show` prints stored data (pairs >= min, candle counts, last candles) without any network access.
 6. **First live collector run (10-minute test): worked for 30-60 s, then the socket closed.** It followed 62 open pairs (43 with payout >= 80%) and all 43 produced candles within 30 s, so following many pairs at once works. Then `Browser WebSocket closed: closed 1005` and, 90 s later, the watchdog exit. **Cause:** this Quotex endpoint uses Engine.IO v3 (`EIO=3`), where the *client* must send a ping (`2`) every `pingInterval` (25 s) or the server drops the connection after about 30 s. The library only answered server pings (the v4 behaviour), and earlier runs were all under 30 s so it never showed. **Fix:** the browser bridge now sends `2` every 20 s from inside the page; the collector also exits immediately when the socket closes instead of waiting 90 s.
 7. **How it was tested without Quotex.** The storage and display part was run on a fake database. The collection logic was run through a simulated feed (fake client, 40 minutes of synthetic ticks, payout changes): with a window of 5, each qualifying pair held exactly the newest 5 candles; a 70% pair stored nothing; dropping a pair to 79% deleted its 5 candles instantly and ticks while below 80 were ignored; raising it to 82% restarted it from empty with no old data; a pair at 81% began tracking; all open pairs were followed. The real run on the VPS is still to be done, and the open question there is whether following about 30 pairs at once works (the status line reports how many pairs are tracked).
+8. **Second live run (10 minutes) after the keepalive fix: success.** Connected, followed 62 open pairs (45 with payout >= 80%), all 45 produced one new candle per minute; status lines kept coming every 30 s through the full 10 minutes; ended with `Time limit reached.` and a clean disconnect. Final: 450 candles over 45 pairs, 0 drops. `--show` listed values such as `SOLUSD_otc 19:05 116.48/116.58/116.44/116.52` (open/high/low/close). The 13 other pairs >= 80% that showed 0 candles were regular (non-OTC) pairs, closed on a Sunday, so correctly not tracked; `--show` now lists only open pairs unless `--all`. (The web terminal then printed "Lost connection to the server": that was the hosting panel's terminal dropping after the run finished, not the collector. It is the reason for running the collector as a background job.)
+9. **Always-on collection and instant reads.** The collector now runs detached from any terminal as a limited, named job (`qx-collector`); first check showed `active (running)`, 404.9 MB (peak 528.7 MB, cap 900 MB), "Following 61 open pairs (36 with payout >= 80%)". Reading is instant because it only reads `candles.db`: `collect_candles.py --show` (table), `--show --json` (all pairs with payout and up to 30 candles as `[timestamp, open, high, low, close, ticks]`), or open the SQLite file directly (tables `pairs`, `candles`). Data lags by under one minute (a candle is saved when its minute ends; the in-progress candle is in memory only). A restart clears the stored candles on purpose (a restart leaves a gap), so after any restart it takes a few minutes to rebuild.
 
 ---
 
@@ -204,7 +210,54 @@ unset QUOTEX_SSID
 .venv/bin/python examples/collect_candles.py --show --last 5      # read what was stored
 ```
 Options: `--min 85` (payout threshold), `--window 60` (candles kept per pair), `--grace 30` (seconds below threshold before deleting), `--stale 300` (seconds without ticks before dropping a pair), `--minutes N` (stop after N minutes; 0 = run until stopped).
-Status line every 30 s: pairs tracked, candles stored, drops so far. Running it detached in the background (a named, limited `systemd-run` job, stoppable with one command) is planned but not set up yet.
+Status line every 30 s: pairs tracked, candles stored, drops so far. `--show` options: `--min`, `--last N` (candles per pair to print), `--all` (include closed pairs), `--json` (machine-readable).
+
+### Running it in the background (what is running now)
+Save the SSID in a private, git-ignored file the collector reads, then start a limited, named job:
+```bash
+cd ~/quotex-api
+git pull
+read -rs -p "SSID: " S; printf 'QUOTEX_SSID=%s\n' "$S" > .env; chmod 600 .env; unset S; echo
+systemd-run --unit=qx-collector --working-directory=$HOME/quotex-api \
+  -E PYTHONUNBUFFERED=1 -p MemoryMax=900M -p MemorySwapMax=0 -p CPUQuota=50% -p Nice=10 \
+  $(command -v xvfb-run) -a $HOME/quotex-api/.venv/bin/python examples/collect_candles.py
+```
+It keeps running after the terminal is closed (it does not survive a server reboot or a crash). Manage it:
+- Live status: `journalctl -u qx-collector -f` (Ctrl+C stops watching, not the job)
+- Is it running: `systemctl status qx-collector`
+- Read data any time: `.venv/bin/python examples/collect_candles.py --show` (or `--show --json`)
+- Stop: `systemctl stop qx-collector`
+
+### Making it permanent (survives crashes and reboots)
+Replaces the transient job with one persistent service file, `/etc/systemd/system/qx-collector.service`, with the same limits. Stop the transient job first (same name):
+```bash
+systemctl stop qx-collector
+cat > /etc/systemd/system/qx-collector.service <<'UNIT'
+[Unit]
+Description=Quotex candle collector
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=10
+
+[Service]
+WorkingDirectory=/root/quotex-api
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/xvfb-run -a /root/quotex-api/.venv/bin/python examples/collect_candles.py
+Restart=on-failure
+RestartSec=30
+MemoryMax=900M
+MemorySwapMax=0
+CPUQuota=50%
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now qx-collector
+```
+Undo: `systemctl disable --now qx-collector && rm /etc/systemd/system/qx-collector.service`.
+Limits of "continuous": after every restart it starts with empty candles and rebuilds for a few minutes. After a restart it logs in again with the SSID in `.env`; if that token has expired the login fails, and the service stops after 10 failures in 15 minutes (put a fresh SSID in `.env`, then `systemctl restart qx-collector`). Automatic SSID renewal is not built.
 
 ### Capture scripts (for investigating Quotex messages)
 `examples/capture_pair.py [PAIR]` and `examples/capture_history.py [PAIR]`, run the same way as above. Output goes to `capture.json` / `capture_history.json` (git-ignored).
@@ -237,6 +290,8 @@ The meaning of the numbers between the payout and the open flag, and whether the
 
 **Live price and payout stream (capture, pair `AUDCAD_otc`, 20 s):** 51 `quotes/stream` ticks and 22 `depth/change` payout updates for the one followed pair, e.g. `[["AUDCAD_otc", 1792934007.654, 1.01653, 0]]` and `[["AUDCAD_otc", 91]]`.
 
+**Candle collection (10-minute run on the VPS, 2026-10-25):** 62 open pairs followed, 45 tracked at payout >= 80%, 450 candles stored (10 per pair), 0 drops, stable connection for the full run (after the keepalive fix); memory about 400-530 MB inside the 900 MB cap. Sample candle rows (open/high/low/close): `EURCHF_otc 19:05 0.92887/0.92913/0.9284/0.92852`, `GBPUSD_otc 19:07 1.33624/1.33624/1.33615/1.33615`, `USDMXN_otc 19:09 19.9064/19.9065/19.9062/19.9065`.
+
 **History requests:** 16 variants tried, none returned candle data (see section 2.9).
 
 ---
@@ -258,7 +313,7 @@ The meaning of the numbers between the payout and the open flag, and whether the
 4. **Email + password login is a stub.** It sends a made-up `login` event. Real Quotex login is over HTTPS with its own protections and needs separate work.
 5. **SSID expiry.** There is no automatic refresh. A long-running process dies when the token expires. This is the biggest blocker for unattended use.
 6. **Candle history from Quotex is unsolved.** The real history request is unknown (see 2.9). Candles are built from live ticks instead, so there is no history before collection starts. Library methods for prices/candles (`get_candles`, `subscribe_candles`) are still the old unverified code; the working path is in `examples/collect_candles.py`.
-7. **Collector: a run past ~1 minute is still unverified.** Following about 43 pairs at once works (confirmed); the keepalive fix for the 30-60 s disconnect has not been re-run yet. No auto-reconnect; it exits after 90 s without ticks. It needs a fresh SSID each run (expires after hours) and runs in the foreground only.
+7. **Collector: long-term behaviour unverified.** Confirmed: 43-45 pairs at once, a stable 10-minute run, background running (first check healthy). Not yet seen: multi-hour or multi-day stability, whether Chrome's memory grows over time, a real payout crossing 80% (drop / restart rules are simulation-tested only), restart after a crash or reboot, and SSID expiry mid-run. After any restart the collector starts with empty candles (gap-avoidance) and needs a few minutes to rebuild.
 8. **Payout per expiry** not identified. Each instrument entry carries more numbers after the payout (for example `60, 30, 3, 0, 67`), and a list like `[[30,"put"],[60,"call"],...]`, whose meaning is unknown. The `depth/change` payout is a single number per pair; whether it applies to the 1-minute expiry is not confirmed.
 9. **Direction code** (`command` 0 = call, 1 = put) is inferred from one winning past order, not tested. The order-placement message (`orders/open`) format is unverified.
 10. **No reconnect.** `_reconnect()` is a stub ("Reconnection would happen here"). If Chrome or the socket drops, the process must be restarted.

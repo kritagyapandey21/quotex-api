@@ -4,7 +4,7 @@ Collect live prices for every open pair and build 1-minute candles (open/high/lo
     python examples/collect_candles.py                 # collect until stopped (Ctrl+C)
     python examples/collect_candles.py --minutes 10    # stop after 10 minutes
     python examples/collect_candles.py --show          # print what is stored (no network)
-    python examples/collect_candles.py --show --min 85 --last 5
+    python examples/collect_candles.py --show --min 85 --last 5   # add --all for closed pairs too
 
 Quotex's own history request is not usable yet, so candles are built from the live tick stream
 (`quotes/stream`): history starts when collection starts. After ~7 minutes there are ~6 complete
@@ -58,8 +58,8 @@ def show(args) -> int:
     rows = db.execute(
         "SELECT p.symbol, p.name, p.payout, p.is_open,"
         " (SELECT COUNT(*) FROM candles c WHERE c.symbol = p.symbol) AS n"
-        " FROM pairs p WHERE p.payout >= ? ORDER BY p.payout DESC, p.symbol",
-        (args.min,),
+        " FROM pairs p WHERE p.payout >= ? AND (p.is_open = 1 OR ?) ORDER BY p.payout DESC, p.symbol",
+        (args.min, 1 if args.all else 0),
     ).fetchall()
     if not rows:
         print("No pairs stored yet. Run the collector first.")
@@ -253,6 +253,7 @@ def main() -> int:
     ap.add_argument("--grace", type=float, default=0, help="seconds a pair may stay below --min before its data is dropped (0 = immediately)")
     ap.add_argument("--stale", type=float, default=300, help="drop a tracked pair's data after this many seconds without ticks")
     ap.add_argument("--show", action="store_true", help="print stored data instead of collecting")
+    ap.add_argument("--all", action="store_true", help="--show: include pairs that are closed")
     ap.add_argument("--last", type=int, default=6, help="--show: candles per pair to print")
     args = ap.parse_args()
     if args.show:

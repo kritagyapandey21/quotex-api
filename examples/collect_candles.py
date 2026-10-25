@@ -5,6 +5,7 @@ Collect live prices for every open pair and build 1-minute candles (open/high/lo
     python examples/collect_candles.py --minutes 10    # stop after 10 minutes
     python examples/collect_candles.py --show          # print what is stored (no network)
     python examples/collect_candles.py --show --min 85 --last 5   # add --all for closed pairs too
+    python examples/collect_candles.py --show --json                  # machine-readable, all stored candles
 
 Quotex's own history request is not usable yet, so candles are built from the live tick stream
 (`quotes/stream`): history starts when collection starts. After ~7 minutes there are ~6 complete
@@ -64,6 +65,18 @@ def show(args) -> int:
     if not rows:
         print("No pairs stored yet. Run the collector first.")
         return 1
+    if args.json:
+        out = {}
+        for symbol, name, payout, is_open, n in rows:
+            candles = db.execute(
+                "SELECT minute_ts, open, high, low, close, ticks FROM candles WHERE symbol=?"
+                " ORDER BY minute_ts",
+                (symbol,),
+            ).fetchall()
+            out[symbol] = {"name": name, "payout": payout, "open": bool(is_open),
+                           "candles": [list(c) for c in candles]}  # [ts, open, high, low, close, ticks]
+        print(json.dumps(out))
+        return 0
     print(f"{'SYMBOL':<16}{'PAYOUT':>7}  {'OPEN':<6}{'CANDLES':>8}   LAST CANDLES (o/h/l/c)")
     for symbol, name, payout, is_open, n in rows:
         last = db.execute(
@@ -254,6 +267,7 @@ def main() -> int:
     ap.add_argument("--stale", type=float, default=300, help="drop a tracked pair's data after this many seconds without ticks")
     ap.add_argument("--show", action="store_true", help="print stored data instead of collecting")
     ap.add_argument("--all", action="store_true", help="--show: include pairs that are closed")
+    ap.add_argument("--json", action="store_true", help="--show: print all pairs and candles as JSON (for other programs)")
     ap.add_argument("--last", type=int, default=6, help="--show: candles per pair to print")
     args = ap.parse_args()
     if args.show:

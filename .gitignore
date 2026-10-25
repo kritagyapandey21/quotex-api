@@ -210,3 +210,4 @@ __marimo__/
 vps/browser/
 instruments_raw.json
 capture.json
+capture_history.json

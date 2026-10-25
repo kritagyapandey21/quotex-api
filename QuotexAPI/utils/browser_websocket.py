@@ -39,21 +39,24 @@ qx.ws = ws;
 ws.onopen = () => { qx.state = 'open'; };
 ws.onclose = (e) => { qx.state = 'closed'; qx.err = 'closed ' + e.code; };
 ws.onerror = () => { qx.err = 'websocket error'; };
-ws.onmessage = async (m) => {
+qx.chain = Promise.resolve();  // keeps frames in arrival order while blobs decode asynchronously
+ws.onmessage = (m) => {
   const d = m.data;
   if (typeof d === 'string') {
     const hit = d.match(/^45\\d*-\\[\\s*"([^"]+)"/);
     if (hit) { qx.pending = hit[1]; return; }
-    qx.q.push(d);
+    qx.chain = qx.chain.then(() => { qx.q.push(d); });
     return;
   }
-  const buf = await (d.arrayBuffer ? d.arrayBuffer() : new Response(d).arrayBuffer());
-  let text = new TextDecoder().decode(buf).replace(/^[\\u0000-\\u001f]+/, '');
-  const name = qx.pending || 'binary';
+  const name = qx.pending || 'binary';  // the placeholder frame always precedes its blob
   qx.pending = null;
-  let payload;
-  try { payload = JSON.parse(text); } catch (e) { payload = text; }
-  qx.q.push('42' + JSON.stringify([name, payload]));
+  qx.chain = qx.chain.then(async () => {
+    const buf = await (d.arrayBuffer ? d.arrayBuffer() : new Response(d).arrayBuffer());
+    const text = new TextDecoder().decode(buf).replace(/^[\\u0000-\\u001f]+/, '');
+    let payload;
+    try { payload = JSON.parse(text); } catch (e) { payload = text; }
+    qx.q.push('42' + JSON.stringify([name, payload]));
+  });
 };
 """
 

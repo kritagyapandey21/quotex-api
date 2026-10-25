@@ -73,7 +73,10 @@ class AccountService(BaseService):
                     )
                     response = await asyncio.wait_for(balance_future, timeout=10.0)
                 except asyncio.TimeoutError:
-                    raise QuotexAPIError("Timed out waiting for the balance from Quotex")
+                    seen = sorted(self._connection._last_events)[:20]
+                    raise QuotexAPIError(
+                        f"Timed out waiting for the balance from Quotex (events received: {seen})"
+                    )
                 finally:
                     self._connection.unsubscribe("s_balance/list", handle_balance)
 

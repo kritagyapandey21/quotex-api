@@ -13,8 +13,12 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 # --- 1. missing OS packages (Chrome runtime libs + virtual display) -------------------
-PKGS="python3 python3-venv xvfb unzip curl ca-certificates libnss3 libgbm1 libasound2 \
-libatk-bridge2.0-0 libgtk-3-0 libxss1 libxkbcommon0 fonts-liberation"
+# Ubuntu 24.04+ renamed some libraries with a t64 suffix; use whichever exists here
+pick() { if apt-cache show "$1t64" >/dev/null 2>&1; then echo "$1t64"; else echo "$1"; fi; }
+PKGS="python3 python3-venv xvfb unzip curl ca-certificates libnss3 libgbm1 $(pick libasound2) \
+$(pick libatk-bridge2.0-0) $(pick libgtk-3-0) libxss1 libxkbcommon0 fonts-liberation"
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
 MISSING=""
 for p in $PKGS; do
     if ! dpkg -s "$p" >/dev/null 2>&1; then
